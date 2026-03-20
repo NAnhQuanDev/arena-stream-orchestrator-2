@@ -11,33 +11,46 @@ function buildRoutes(orchestrator) {
 
   const handleStartLive = asyncHandler(async (req, res) => {
     const result = await orchestrator.startLive(req.body || {});
-    const deviceId = req.body?.deviceid;
-    if (deviceId) {
-      sendToDevice(deviceId, {
-        status: 'message',
-        action: 'start-live',
-        deviceId: String(deviceId),
-        streamUrl: req.body?.outputStream || '',
-      });
-    }
     res.json(success('STARTLIVE_SUCCESS', 'Start live thanh cong.', result));
   });
 
   const handleStopLive = asyncHandler(async (req, res) => {
     const result = await orchestrator.stopLive(req.body || {});
-    const deviceId = req.body?.deviceid;
-    if (deviceId && result?.routedTo) {
-      sendToDevice(deviceId, {
-        status: 'message',
-        action: 'stop-live',
-        deviceId: String(deviceId),
-      });
-    }
     res.json(success('STOPLIVE_SUCCESS', 'Stop live thanh cong.', result));
+  });
+
+  const handleStartLiveFb = asyncHandler(async (req, res) => {
+    const deviceId = String(req.body?.deviceId || req.body?.deviceid || '').trim();
+    const streamUrl = req.body?.streamUrl || req.body?.outputStream || '';
+    if (!deviceId) return res.status(400).json({ error: 'Thieu deviceId' });
+
+    const sent = sendToDevice(deviceId, {
+      status: 'message',
+      action: 'start-live',
+      deviceId,
+      streamUrl,
+    });
+
+    return res.json({ sent });
+  });
+
+  const handleStopLiveFb = asyncHandler(async (req, res) => {
+    const deviceId = String(req.body?.deviceId || req.body?.deviceid || '').trim();
+    if (!deviceId) return res.status(400).json({ error: 'Thieu deviceId' });
+
+    const sent = sendToDevice(deviceId, {
+      status: 'message',
+      action: 'stop-live',
+      deviceId,
+    });
+
+    return res.json({ sent });
   });
 
   router.post('/startlive', handleStartLive);
   router.post('/stoplive', handleStopLive);
+  router.post('/start-live-fb', handleStartLiveFb);
+  router.post('/stop-live-fb', handleStopLiveFb);
 
   router.post('/orchestrator/startlive', handleStartLive);
   router.post('/orchestrator/stoplive', handleStopLive);
