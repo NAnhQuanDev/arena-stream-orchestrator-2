@@ -5,6 +5,7 @@ const { BizflyClient } = require('./services/bizflyClient');
 const { OrchestratorService } = require('./services/orchestratorService');
 const { buildRoutes } = require('./routes/orchestratorRoutes');
 const { maskStreamUrl } = require('./services/httpClient');
+const { toClientError } = require('./utils/clientResponse');
 
 function sanitizeBody(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
@@ -49,11 +50,8 @@ async function main() {
   app.use('/api', buildRoutes(orchestrator));
 
   app.use((error, _req, res, _next) => {
-    const status = Number(error.status) || 500;
-    res.status(status).json({
-      error: error.message || 'Internal Server Error',
-      code: error.code || 'INTERNAL_ERROR',
-    });
+    const { status, payload } = toClientError(_req, error);
+    res.status(status).json(payload);
   });
 
   const server = app.listen(config.port, () => {

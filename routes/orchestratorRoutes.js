@@ -1,4 +1,5 @@
 const express = require('express');
+const { success } = require('../utils/clientResponse');
 
 function asyncHandler(fn) {
   return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -9,12 +10,12 @@ function buildRoutes(orchestrator) {
 
   const handleStartLive = asyncHandler(async (req, res) => {
     const result = await orchestrator.startLive(req.body || {});
-    res.json(result);
+    res.json(success('STARTLIVE_SUCCESS', 'Start live thanh cong.', result));
   });
 
   const handleStopLive = asyncHandler(async (req, res) => {
     const result = await orchestrator.stopLive(req.body || {});
-    res.json(result);
+    res.json(success('STOPLIVE_SUCCESS', 'Stop live thanh cong.', result));
   });
 
   router.post('/startlive', handleStartLive);
