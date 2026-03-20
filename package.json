@@ -1,0 +1,22 @@
+{
+  "name": "arena-stream-orchestrator",
+  "version": "1.0.0",
+  "description": "Coordinator service for Arena stream worker nodes",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"No tests configured\""
+  },
+  "keywords": [
+    "arena",
+    "livestream",
+    "orchestrator",
+    "bizfly"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0"
+  }
+}
