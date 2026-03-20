@@ -1,5 +1,6 @@
 const express = require('express');
 const { success } = require('../utils/clientResponse');
+const { sendToDevice } = require('../websocket/websocketServer');
 
 function asyncHandler(fn) {
   return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
@@ -10,11 +11,28 @@ function buildRoutes(orchestrator) {
 
   const handleStartLive = asyncHandler(async (req, res) => {
     const result = await orchestrator.startLive(req.body || {});
+    const deviceId = req.body?.deviceid;
+    if (deviceId) {
+      sendToDevice(deviceId, {
+        status: 'message',
+        action: 'start-live',
+        deviceId: String(deviceId),
+        streamUrl: req.body?.outputStream || '',
+      });
+    }
     res.json(success('STARTLIVE_SUCCESS', 'Start live thanh cong.', result));
   });
 
   const handleStopLive = asyncHandler(async (req, res) => {
     const result = await orchestrator.stopLive(req.body || {});
+    const deviceId = req.body?.deviceid;
+    if (deviceId && result?.routedTo) {
+      sendToDevice(deviceId, {
+        status: 'message',
+        action: 'stop-live',
+        deviceId: String(deviceId),
+      });
+    }
     res.json(success('STOPLIVE_SUCCESS', 'Stop live thanh cong.', result));
   });
 

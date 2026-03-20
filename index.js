@@ -1,4 +1,5 @@
 const express = require('express');
+const http = require('http');
 const { config } = require('./config');
 const logger = require('./utils/logger');
 const { BizflyClient } = require('./services/bizflyClient');
@@ -6,6 +7,7 @@ const { OrchestratorService } = require('./services/orchestratorService');
 const { buildRoutes } = require('./routes/orchestratorRoutes');
 const { maskStreamUrl } = require('./services/httpClient');
 const { toClientError } = require('./utils/clientResponse');
+const { initServerSocket } = require('./websocket/websocketServer');
 
 function sanitizeBody(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
@@ -54,9 +56,13 @@ async function main() {
     res.status(status).json(payload);
   });
 
-  const server = app.listen(config.port, () => {
+  const server = http.createServer(app);
+  initServerSocket(server);
+
+  server.listen(config.port, () => {
     logger.simple(`Orchestrator API running at ${config.port}`);
     logger.simple(`Configured stream nodes: ${config.streamNodes.length}`);
+    logger.simple(`WebSocket endpoint: ws://<host>:${config.port}/ws/:deviceId  or  /ws?deviceId=...`);
   });
 
   try {
