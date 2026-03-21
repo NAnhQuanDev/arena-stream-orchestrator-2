@@ -32,6 +32,13 @@ function mapStartLiveError(error) {
     };
   }
 
+  if (code === 'DEVICE_START_CANCELLED') {
+    return {
+      type: 'STARTLIVE_CANCELLED',
+      message: 'Start live da bi huy boi lenh stoplive.',
+    };
+  }
+
   return {
     type: 'STARTLIVE_FAILED',
     message: 'Start live that bai.',

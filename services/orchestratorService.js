@@ -28,6 +28,35 @@ function safeJson(value, maxLen = 800) {
   }
 }
 
+async function waitPromiseOrCancel(promise, isCancelled, pollMs = 120) {
+  let settled = false;
+  let value;
+  let error;
+
+  promise.then(
+    (v) => {
+      settled = true;
+      value = v;
+    },
+    (e) => {
+      settled = true;
+      error = e;
+    },
+  );
+
+  while (!settled) {
+    if (isCancelled()) {
+      const err = new Error('Operation cancelled');
+      err.code = 'CANCELLED';
+      throw err;
+    }
+    await sleep(pollMs);
+  }
+
+  if (error) throw error;
+  return value;
+}
+
 // ---------------------------------------------------------------------------
 // OrchestratorService
 // ---------------------------------------------------------------------------
@@ -464,39 +493,39 @@ class OrchestratorService {
       await Promise.race([inflightStop.catch(() => {}), sleep(5000)]);
     }
 
-    const busyWaitDeadline = Date.now() + 5000;
-    while (true) {
-      const existingInflight = this.inflightStartState.get(deviceId);
-      if (!existingInflight) break;
-      if (existingInflight.cancelled) {
-        if (this.inflightStartState.get(deviceId) === existingInflight) {
-          this.inflightStartState.delete(deviceId);
-        }
-        break;
+    const existingInflight = this.inflightStartState.get(deviceId);
+    if (existingInflight) {
+      existingInflight.cancelled = true;
+      this.logger.info('orchestrator', `startLive supersede in-flight start for device=${deviceId}`);
+      await Promise.race([existingInflight.donePromise || Promise.resolve(), sleep(5000)]);
+      if (this.inflightStartState.get(deviceId) === existingInflight) {
+        this.inflightStartState.delete(deviceId);
       }
-      if (Date.now() >= busyWaitDeadline) {
-        const err  = new Error(`Device ${deviceId} already has an in-flight start request`);
-        err.status = 409;
-        err.code   = 'DEVICE_START_BUSY';
-        throw err;
-      }
-      await sleep(120);
     }
 
     if (this.deviceAssignments.has(deviceId)) {
       const assignedServerId = this.deviceAssignments.get(deviceId);
       const assignedNode     = this.nodes.get(assignedServerId);
-      const err  = new Error(`Device ${deviceId} is already live on node ${assignedNode?.name ?? assignedServerId}`);
-      err.status = 409;
-      err.code   = 'DEVICE_ALREADY_LIVE';
-      throw err;
+      this.logger.info(
+        'orchestrator',
+        `startLive replace existing assignment device=${deviceId} node=${assignedNode?.name ?? assignedServerId}`,
+      );
+      try {
+        await this.stopLive({ deviceid: deviceId });
+      } catch (err) {
+        this.logger.warn('orchestrator', `startLive pre-stop failed for device=${deviceId}: ${err.message}`);
+      }
+      this.deviceAssignments.delete(deviceId);
     }
 
     const nextEpoch = (this.deviceStartEpoch.get(deviceId) || 0) + 1;
     this.deviceStartEpoch.set(deviceId, nextEpoch);
-    const state = { cancelled: false, epoch: nextEpoch };
+    let resolveDone;
+    const donePromise = new Promise((resolve) => { resolveDone = resolve; });
+    const state = { cancelled: false, epoch: nextEpoch, donePromise, resolveDone };
     this.inflightStartState.set(deviceId, state);
     let reservedNode = null;
+    const isCurrentState = () => this.inflightStartState.get(deviceId) === state;
 
     const release = () => {
       this.releaseSlot(reservedNode);
@@ -504,7 +533,7 @@ class OrchestratorService {
     };
 
     const checkCancelled = () => {
-      if (!state.cancelled) return;
+      if (!state.cancelled && isCurrentState()) return;
       const err  = new Error(`Device ${deviceId} start was cancelled by stopLive`);
       err.status = 409;
       err.code   = 'DEVICE_START_CANCELLED';
@@ -512,7 +541,7 @@ class OrchestratorService {
     };
 
     const checkCancelledAfterDispatch = (node) => {
-      if (!state.cancelled) return;
+      if (!state.cancelled && isCurrentState()) return;
       const latestEpoch = this.deviceStartEpoch.get(deviceId);
       if (latestEpoch !== state.epoch) {
         const err  = new Error(`Device ${deviceId} start was cancelled by stopLive`);
@@ -526,6 +555,15 @@ class OrchestratorService {
       err.status = 409;
       err.code   = 'DEVICE_START_CANCELLED';
       throw err;
+    };
+
+    const waitWakeOrCancelled = async (promise) => {
+      try {
+        return await waitPromiseOrCancel(promise, () => state.cancelled || !isCurrentState(), 120);
+      } catch (err) {
+        if (err?.code === 'CANCELLED') checkCancelled();
+        throw err;
+      }
     };
 
     try {
@@ -546,7 +584,7 @@ class OrchestratorService {
         if (!reservedNode) throw this.createNoSlotError(target, `No available slot on target node: ${target.name}`);
         checkCancelled();
 
-        await this._wakeNode(pinnedId);
+        await waitWakeOrCancelled(this._wakeNode(pinnedId));
         checkCancelled();
 
         if (!target.health?.reachable) {
@@ -572,7 +610,7 @@ class OrchestratorService {
         throw err;
       }
 
-      await this._wakeNode(reservedNode.serverId);
+      await waitWakeOrCancelled(this._wakeNode(reservedNode.serverId));
       checkCancelled();
 
       if (!reservedNode.health?.reachable) {
@@ -587,7 +625,7 @@ class OrchestratorService {
           err.code   = 'NO_CAPACITY';
           throw err;
         }
-        await this._wakeNode(reservedNode.serverId);
+        await waitWakeOrCancelled(this._wakeNode(reservedNode.serverId));
         checkCancelled();
       }
 
@@ -608,7 +646,7 @@ class OrchestratorService {
         reservedNode = await this.enqueue(() => this.pickAndReserveNode({ excludeServerIds: new Set([failedId]) }));
         if (!reservedNode) throw err;
 
-        await this._wakeNode(reservedNode.serverId);
+        await waitWakeOrCancelled(this._wakeNode(reservedNode.serverId));
         checkCancelled();
         const workerResponse = await this.dispatchStart(reservedNode, payload);
         checkCancelledAfterDispatch(reservedNode);
@@ -618,6 +656,7 @@ class OrchestratorService {
         return { message: 'Livestream routed successfully (fallback node)', routedTo: this.serializeNode(reservedNode), workerResponse };
       }
     } finally {
+      if (typeof state.resolveDone === 'function') state.resolveDone();
       release();
       if (this.inflightStartState.get(deviceId) === state) {
         this.inflightStartState.delete(deviceId);
@@ -688,6 +727,7 @@ class OrchestratorService {
     if (inflightState) {
       inflightState.cancelled = true;
       this.deviceAssignments.delete(deviceId);
+      await Promise.race([inflightState.donePromise || Promise.resolve(), sleep(5000)]);
       if (this.inflightStartState.get(deviceId) === inflightState) {
         this.inflightStartState.delete(deviceId);
       }
