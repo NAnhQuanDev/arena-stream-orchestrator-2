@@ -42,8 +42,9 @@ class OrchestratorService {
     this.deviceAssignments      = new Map(); // deviceId → serverId
 
     // Track device đang trong quá trình startLive (kể cả giai đoạn wakeup).
-    // value: { cancelled: bool } — stopLive set cancelled=true để abort ngay.
-    this.inflightStartState = new Map(); // deviceId → { cancelled }
+    // value: { cancelled: bool, epoch: number } — stopLive set cancelled=true để abort ngay.
+    this.inflightStartState = new Map(); // deviceId → { cancelled, epoch }
+    this.deviceStartEpoch = new Map();   // deviceId → epoch (monotonic)
 
     // Serial queue — serialize chỉ bước pick+reserve slot (sync, micro-giây).
     this.lastOperation = Promise.resolve();
@@ -474,11 +475,18 @@ class OrchestratorService {
     // Chặn request trùng: đang trong quá trình start (wakeup/dispatch) hoặc đã live.
     // inflightStartState tồn tại từ khi bắt đầu startLive đến khi finally xóa —
     // bao phủ toàn bộ giai đoạn wakeup, tức là spam lần 2 trong lúc đang wake cũng bị chặn.
-    if (this.inflightStartState.has(deviceId)) {
-      const err  = new Error(`Device ${deviceId} already has an in-flight start request`);
-      err.status = 409;
-      err.code   = 'DEVICE_START_BUSY';
-      throw err;
+    const existingInflight = this.inflightStartState.get(deviceId);
+    if (existingInflight) {
+      // Nếu request cũ đã bị stopLive cancel, cho phép request mới vào ngay.
+      // Tránh kẹt DEVICE_START_BUSY khi user stop rồi start lại nhanh.
+      if (existingInflight.cancelled) {
+        this.inflightStartState.delete(deviceId);
+      } else {
+        const err  = new Error(`Device ${deviceId} already has an in-flight start request`);
+        err.status = 409;
+        err.code   = 'DEVICE_START_BUSY';
+        throw err;
+      }
     }
 
     if (this.deviceAssignments.has(deviceId)) {
@@ -491,7 +499,10 @@ class OrchestratorService {
     }
 
     // state.cancelled = true khi stopLive được gọi trong lúc đang start.
-    const state = { cancelled: false };
+    // epoch giúp phân biệt request cũ/mới để tránh stop nhầm request mới.
+    const nextEpoch = (this.deviceStartEpoch.get(deviceId) || 0) + 1;
+    this.deviceStartEpoch.set(deviceId, nextEpoch);
+    const state = { cancelled: false, epoch: nextEpoch };
     this.inflightStartState.set(deviceId, state);
     let reservedNode = null;
 
@@ -513,6 +524,14 @@ class OrchestratorService {
     // Nếu stopLive cancel trong cửa sổ này, gửi stoplive để dọn dẹp rồi throw.
     const checkCancelledAfterDispatch = (node) => {
       if (!state.cancelled) return;
+      // Nếu đã có start request mới hơn, không gửi stoplive nữa để tránh kill nhầm stream mới.
+      const latestEpoch = this.deviceStartEpoch.get(deviceId);
+      if (latestEpoch !== state.epoch) {
+        const err  = new Error(`Device ${deviceId} start was cancelled by stopLive`);
+        err.status = 409;
+        err.code   = 'DEVICE_START_CANCELLED';
+        throw err;
+      }
       this.requestWorker(node, '/stoplive', 'POST', { deviceid: deviceId }, this.config.nodeCommandTimeoutMs)
         .catch((e) => this.logger.warn('orchestrator', `Cancel stoplive failed device=${deviceId}: ${e.message}`));
       const err  = new Error(`Device ${deviceId} start was cancelled by stopLive`);
@@ -614,7 +633,11 @@ class OrchestratorService {
       }
     } finally {
       release();
-      this.inflightStartState.delete(deviceId);
+      // Chỉ xóa nếu state hiện tại vẫn là của request này.
+      // Tránh request cũ xóa nhầm state của request mới (race stop->start nhanh).
+      if (this.inflightStartState.get(deviceId) === state) {
+        this.inflightStartState.delete(deviceId);
+      }
     }
   }
 
@@ -665,6 +688,9 @@ class OrchestratorService {
     if (inflightState) {
       inflightState.cancelled = true;
       this.deviceAssignments.delete(deviceId);
+      if (this.inflightStartState.get(deviceId) === inflightState) {
+        this.inflightStartState.delete(deviceId);
+      }
       this.logger.info('orchestrator', `stopLive cancelled in-flight start for device=${deviceId}`);
       return {
         message:        'In-flight start cancelled',
