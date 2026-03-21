@@ -2,7 +2,7 @@ const { WebSocketServer } = require('ws');
 const url = require('url');
 const logger = require('../utils/logger');
 
-const rooms = new Map(); // deviceId -> Set<ws>
+const rooms = new Map();
 
 function sendJSON(ws, obj) {
   try { ws.send(JSON.stringify(obj)); } catch {}
@@ -48,9 +48,7 @@ function initServerSocket(httpServer) {
         const obj = JSON.parse(raw.toString());
         const action = obj.action || obj.cmd || obj.status || '-';
         logger.info(ws.deviceId, `WS recv: ${action}`);
-      } catch {
-        // Not JSON
-      }
+      } catch {}
     });
 
     ws.on('close', () => {

@@ -38,22 +38,18 @@ class OrchestratorService {
     this.bizflyClient  = bizflyClient;
     this.logger        = logger;
 
-    this.nodes                  = new Map(); // serverId → node
-    this.deviceAssignments      = new Map(); // deviceId → serverId
+    this.nodes                  = new Map();
+    this.deviceAssignments      = new Map();
 
-    // Track device đang trong quá trình startLive (kể cả giai đoạn wakeup).
-    // value: { cancelled: bool, epoch: number } — stopLive set cancelled=true để abort ngay.
-    this.inflightStartState = new Map(); // deviceId → { cancelled, epoch }
-    this.deviceStartEpoch = new Map();   // deviceId → epoch (monotonic)
+    this.inflightStartState = new Map();
+    this.deviceStartEpoch = new Map();
+    this.inflightStopState = new Map();
 
-    // Serial queue — serialize chỉ bước pick+reserve slot (sync, micro-giây).
     this.lastOperation = Promise.resolve();
 
-    // Dedup concurrent refreshClusterStatus.
     this.clusterRefreshPromise = null;
     this.lastClusterRefreshAt  = 0;
 
-    // Guard chống 2 reconcileNow chạy đồng thời (BUG-12).
     this.reconcileRunning = false;
     this.reconcileTimer   = null;
 
@@ -235,7 +231,6 @@ class OrchestratorService {
   }
 
   syncAssignmentsFromHealth() {
-    // Xây dựng ground-truth từ health report của tất cả reachable node.
     const fromHealth = new Map();
     for (const node of this.nodes.values()) {
       if (!node.health?.reachable) continue;
@@ -248,20 +243,15 @@ class OrchestratorService {
       const node = this.nodes.get(sid);
 
       if (!node || !node.health?.reachable) {
-        // Node không reachable → xóa, không biết thật sự đang chạy gì.
         this.deviceAssignments.delete(did);
         continue;
       }
 
-      // Node reachable nhưng device không có trong runningDeviceIds của nó
-      // VÀ không có trong inflightStartState (không đang trong giai đoạn wakeup/dispatch).
-      // → assignment stale, xóa để không chặn start lại.
       if (!fromHealth.has(did) && !this.inflightStartState.has(did)) {
         this.deviceAssignments.delete(did);
       }
     }
 
-    // Thêm/cập nhật từ health report.
     for (const [did, sid] of fromHealth) {
       this.deviceAssignments.set(did, sid);
     }
@@ -281,7 +271,6 @@ class OrchestratorService {
     return Math.max(0, hint - reserved);
   }
 
-  // PHẢI gọi trong enqueue() — sync, không có await.
   pickAndReserveNode({ excludeServerIds = new Set(), onlyServerId = null } = {}) {
     const candidates = onlyServerId
       ? [this.nodes.get(onlyServerId)].filter(Boolean)
@@ -293,7 +282,6 @@ class OrchestratorService {
             if (r !== 0) return r;
             const ac = (b.powerStatus === 'ACTIVE' ? 1 : 0) - (a.powerStatus === 'ACTIVE' ? 1 : 0);
             if (ac !== 0) return ac;
-            // PACK strategy: dồn stream vào node đang có worker trước, chỉ spill sang node khác khi gần/full.
             const w = toNumber(b.health?.stats?.currentWorkers) - toNumber(a.health?.stats?.currentWorkers);
             if (w !== 0) return w;
             const e = this.getEffectiveAvailableSlots(a) - this.getEffectiveAvailableSlots(b);
@@ -424,8 +412,6 @@ class OrchestratorService {
     return this.enqueue(() => this._sleepNode(serverId, { force, reason }));
   }
 
-  // FIX BUG-14: _sleepNode luôn chạy trong enqueue (cả autoSleep lẫn manual).
-  // activeCount đọc bên trong lock → không thể race với _sleepNode khác.
   async _sleepNode(serverId, { force = false, reason = 'manual' } = {}) {
     const node = this.nodes.get(serverId);
     if (!node) throw new Error(`Unknown serverId: ${serverId}`);
@@ -472,21 +458,29 @@ class OrchestratorService {
       `startLive device=${deviceId} output=${maskStreamUrl(outputStream)} target=${targetServerId || serverId || 'auto'}`,
     );
 
-    // Chặn request trùng: đang trong quá trình start (wakeup/dispatch) hoặc đã live.
-    // inflightStartState tồn tại từ khi bắt đầu startLive đến khi finally xóa —
-    // bao phủ toàn bộ giai đoạn wakeup, tức là spam lần 2 trong lúc đang wake cũng bị chặn.
-    const existingInflight = this.inflightStartState.get(deviceId);
-    if (existingInflight) {
-      // Nếu request cũ đã bị stopLive cancel, cho phép request mới vào ngay.
-      // Tránh kẹt DEVICE_START_BUSY khi user stop rồi start lại nhanh.
+    const inflightStop = this.inflightStopState.get(deviceId);
+    if (inflightStop) {
+      this.logger.info('orchestrator', `startLive waiting in-flight stop for device=${deviceId}`);
+      await Promise.race([inflightStop.catch(() => {}), sleep(5000)]);
+    }
+
+    const busyWaitDeadline = Date.now() + 5000;
+    while (true) {
+      const existingInflight = this.inflightStartState.get(deviceId);
+      if (!existingInflight) break;
       if (existingInflight.cancelled) {
-        this.inflightStartState.delete(deviceId);
-      } else {
+        if (this.inflightStartState.get(deviceId) === existingInflight) {
+          this.inflightStartState.delete(deviceId);
+        }
+        break;
+      }
+      if (Date.now() >= busyWaitDeadline) {
         const err  = new Error(`Device ${deviceId} already has an in-flight start request`);
         err.status = 409;
         err.code   = 'DEVICE_START_BUSY';
         throw err;
       }
+      await sleep(120);
     }
 
     if (this.deviceAssignments.has(deviceId)) {
@@ -498,8 +492,6 @@ class OrchestratorService {
       throw err;
     }
 
-    // state.cancelled = true khi stopLive được gọi trong lúc đang start.
-    // epoch giúp phân biệt request cũ/mới để tránh stop nhầm request mới.
     const nextEpoch = (this.deviceStartEpoch.get(deviceId) || 0) + 1;
     this.deviceStartEpoch.set(deviceId, nextEpoch);
     const state = { cancelled: false, epoch: nextEpoch };
@@ -511,7 +503,6 @@ class OrchestratorService {
       reservedNode = null;
     };
 
-    // Throw ngay nếu stopLive đã cancel trong khi đang await (trước dispatch).
     const checkCancelled = () => {
       if (!state.cancelled) return;
       const err  = new Error(`Device ${deviceId} start was cancelled by stopLive`);
@@ -520,11 +511,8 @@ class OrchestratorService {
       throw err;
     };
 
-    // Sau khi dispatch thành công — stream đã chạy thật trên worker.
-    // Nếu stopLive cancel trong cửa sổ này, gửi stoplive để dọn dẹp rồi throw.
     const checkCancelledAfterDispatch = (node) => {
       if (!state.cancelled) return;
-      // Nếu đã có start request mới hơn, không gửi stoplive nữa để tránh kill nhầm stream mới.
       const latestEpoch = this.deviceStartEpoch.get(deviceId);
       if (latestEpoch !== state.epoch) {
         const err  = new Error(`Device ${deviceId} start was cancelled by stopLive`);
@@ -544,7 +532,6 @@ class OrchestratorService {
       await this.refreshClusterStatus();
       checkCancelled();
 
-      // ---- Pinned target ----
       const pinnedId = String(targetServerId || serverId || '').trim();
       if (pinnedId) {
         const target = this.nodes.get(pinnedId);
@@ -576,7 +563,6 @@ class OrchestratorService {
         return { message: 'Livestream routed successfully (target node)', routedTo: this.serializeNode(target), workerResponse };
       }
 
-      // ---- Auto-select ----
       reservedNode = await this.enqueue(() => this.pickAndReserveNode());
 
       if (!reservedNode) {
@@ -633,8 +619,6 @@ class OrchestratorService {
       }
     } finally {
       release();
-      // Chỉ xóa nếu state hiện tại vẫn là của request này.
-      // Tránh request cũ xóa nhầm state của request mới (race stop->start nhanh).
       if (this.inflightStartState.get(deviceId) === state) {
         this.inflightStartState.delete(deviceId);
       }
@@ -681,9 +665,25 @@ class OrchestratorService {
 
     const deviceId = String(deviceid);
 
-    // Nếu device đang trong quá trình startLive (wakeup / dispatch):
-    // set cancelled=true để _startLive dừng ngay sau await tiếp theo,
-    // đồng thời xóa assignment phòng trường hợp dispatch vừa xong.
+    if (this.inflightStopState.has(deviceId)) {
+      this.logger.info('orchestrator', `stopLive join in-flight stop for device=${deviceId}`);
+      return this.inflightStopState.get(deviceId);
+    }
+
+    const stopPromise = this._stopLiveInternal(payload, deviceId);
+    this.inflightStopState.set(deviceId, stopPromise);
+    try {
+      return await stopPromise;
+    } finally {
+      if (this.inflightStopState.get(deviceId) === stopPromise) {
+        this.inflightStopState.delete(deviceId);
+      }
+    }
+  }
+
+  async _stopLiveInternal(payload, deviceId) {
+    const { deviceid } = payload || {};
+
     const inflightState = this.inflightStartState.get(deviceId);
     if (inflightState) {
       inflightState.cancelled = true;
@@ -720,7 +720,6 @@ class OrchestratorService {
 
     this.deviceAssignments.delete(deviceId);
 
-    // Fire-and-forget sau khi trả response — lỗi chỉ warn, không ảnh hưởng caller.
     this.safeRefreshNodeHealth(target, 'stoplive').catch(() => {});
     this.autoSleepIdleNodes().catch((err) =>
       this.logger.warn('orchestrator', `autoSleep after stop failed: ${err.message}`)
@@ -729,8 +728,6 @@ class OrchestratorService {
     return { message: 'Stop request routed successfully', routedTo: this.serializeNode(target), workerResponse: res.data };
   }
 
-  // FIX BUG-05: probe song song thay vì tuần tự.
-  // Thời gian = max(timeout của 1 node) thay vì N × timeout.
   async findNodeByDevice(deviceId) {
     const cached = this.deviceAssignments.get(deviceId);
     if (cached) {
@@ -757,7 +754,6 @@ class OrchestratorService {
   // Reconcile
   // -------------------------------------------------------------------------
 
-  // FIX BUG-12: guard reconcileRunning chống 2 lần chạy đồng thời.
   async reconcileNow() {
     if (this.reconcileRunning) {
       this.logger.warn('orchestrator', 'Reconcile skipped — previous run still in progress');
@@ -784,8 +780,6 @@ class OrchestratorService {
     }
   }
 
-  // FIX BUG-14 (phần 2): gọi _sleepNode qua enqueue để activeCount
-  // được đọc trong lock, tránh race với manual sleepNode đồng thời.
   async autoSleepIdleNodes() {
     if (this.config.autoSleepIdleMs <= 0) return;
 
