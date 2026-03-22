@@ -63,7 +63,9 @@ function initServerSocket(httpServer) {
 
   httpServer.on('upgrade', (req, socket, head) => {
     const { pathname } = url.parse(req.url);
+    // Chỉ handle /ws/* NHƯNG KHÔNG handle /ws/live/* (để LiveWebSocket xử lý)
     if (!pathname?.startsWith('/ws')) return socket.destroy();
+    if (pathname.startsWith('/ws/live')) return; // skip — LiveWebSocket sẽ handle
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
   });
 
